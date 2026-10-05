@@ -1,0 +1,24 @@
+# Example site config. Copy this file to config/sites/<site>.toml, fill in the
+# values for your cluster, and select it with VIBESYS_SITE=<site>.
+platform = "mi300a-rocm700"
+startup_timeout_s = 1200
+
+[paths]
+model = "/path/to/models/Qwen3.5-397B-A17B-MXFP4"
+draft_model = "/path/to/models/Qwen3.5-397B-A17B-MXFP4-mtp-sharded-tp4"
+sharded_artifact = "/path/to/models/Qwen3.5-397B-A17B-MXFP4-sharded-tp4"
+sharded_artifact_striped = "/path/to/models/Qwen3.5-397B-A17B-MXFP4-sharded-tp4-striped"
+aiter_jit_dir = "/path/to/aiter-jit-cache"
+hip_ext_dir = "/path/to/hip-ext-cache"
+tmpfs_root = "/dev/shm"
+log_dir = "/path/to/logs"
+checkout = "/path/to/sglang"
+
+[slurm]
+account = "<account>"
+partition = "<partition>"
+edf = "/path/to/runtime.toml"
+
+[lustre]
+stripe_count = 8
+stripe_size = "4M"

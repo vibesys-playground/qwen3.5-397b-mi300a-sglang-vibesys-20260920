@@ -1,0 +1,18 @@
+version = 1
+
+[agent]
+domain = "llm-serving"
+
+[resources]
+nodes = 1
+accelerators_per_node = 4
+accelerator_backend = "rocm"
+
+[accuracy]
+command = ["python3", ".vibesys/tasks/multiturn/accuracy_checker/checker.py", "--workspace", "${PROJECT_ROOT}"]
+timeout_seconds = 7200
+
+[benchmark]
+command = ["python3", ".vibesys/tasks/multiturn/benchmark/run.py", "--workspace", "${PROJECT_ROOT}"]
+timeout_seconds = 9000
+result_protocol = 2

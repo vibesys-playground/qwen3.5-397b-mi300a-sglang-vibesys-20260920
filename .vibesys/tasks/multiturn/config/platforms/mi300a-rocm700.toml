@@ -1,0 +1,319 @@
+# Platform: 4x AMD MI300A (ROCm) plus the container image this harness's
+# fast-boot recipe is validated against. Anything true of any node with this
+# GPU and image lives here. Per-site paths and scheduler identity live in
+# config/sites/<site>.toml instead; a site names the platform it runs.
+#
+# Flag choices for the AMD/ROCm + MXFP4 launch are drawn from two in-tree
+# SGLang sources at the pinned tag: docs/docs/hardware-platforms/amd_gpu.mdx
+# (AITER backend, page-size 16, the SGLANG_USE_AITER* env vars) and
+# docs/src/snippets/autoregressive/qwen35-deployment.jsx (the Qwen3.5
+# deployment generator's MI355X + MXFP4 branch, the only in-tree recipe for
+# the amd/Qwen3.5-397B-A17B-MXFP4 checkpoint on AMD hardware). That recipe
+# targets MI355X (CDNA4), not MI300A; MXFP4 is documented as requiring
+# CDNA3/CDNA4 in general, which MI300A satisfies, but the exact flag set has
+# not been independently validated on MI300A beyond what is pinned here.
+#
+# Deliberately not applied: the MI355X recipe's --disable-radix-cache. That
+# flag exists because Blackwell/MI355X FP4 kernels reportedly need it, not
+# because this workload wants it off; the workload is multi-turn chat with
+# growing per-session history, so prefix reuse across a session's turns is
+# central to the metric being measured. Leaving the cache in its default
+# state lets the candidate's own choices determine the score.
+
+# --attention-backend / --page-size: AITER backend, page-size 16
+# (amd_gpu.mdx recipe).
+attention_backend = "aiter"
+page_size = 16
+
+# --mem-fraction-static: matches the validated boot; 0.85 previously drove
+# rank OOM kills during scheduler init. Kept as a string so the argv value
+# on the launch command line is exactly "0.72".
+mem_fraction_static = "0.72"
+
+tp = 4
+
+# Extra argv tokens appended after the config-derived flags above, and
+# before $VIBESYS_EXTRA_SERVER_ARGS (see build_launch_argv, _server.py).
+#
+# On by default: mixed chunked prefill at chunk size 1024. Under benchmark
+# version 2, on top of the fused MoE and skinny GEMM (see [env_defaults]
+# below), it lowered pooled p95 TTFT turn 2+ from 574 to 493 ms and TPOT
+# from 36.9 to 35.3 ms, in 5 of 5 reps (job 632584, ledger row H8b). It also
+# bounds prefill batch size, which prevents the multi-second stall seen with
+# unchunked prefill: burst admission plus aiter's per-shape fallback kernel
+# resolution at prefill M up to 2779 is the analyzed cause of that stall.
+#
+# Not applied whenever [speculative] below is in effect: server_args.py's
+# validation asserts enable_mixed_chunk is off when speculative_algorithm is
+# set, and arg_groups/speculative_hook.py forces it off itself on the
+# EAGLE-family paths NEXTN uses. The flag stays here rather than being
+# removed because it still applies with VIBESYS_SPEC_DECODE=0.
+extra_args = ["--enable-mixed-chunk", "--chunked-prefill-size", "1024"]
+
+# --max-total-tokens: SGLang sizes the KV pool from free memory after weight
+# load, which is not stable; it floated ~780k-900k tokens across
+# otherwise-identical boots on the HF checkpoint path, and reached 1.76M on
+# the sharded-artifact path (page cache no longer occupies HBM at profile
+# time there), starving CUDA graph capture (136s instead of 30-50s) and
+# leaving the node only 9 GB free. Pin the pool to the smallest value the
+# validated baselines got so the served configuration does not depend on
+# the loader's residue. The benchmark needs well under 200k tokens in
+# flight, so this is not a limit.
+max_total_tokens = 787936
+
+# Vars applied unconditionally (os.environ[key] = value), overriding whatever
+# the caller's environment already set.
+[env]
+SGLANG_USE_AITER = "1"
+SGLANG_USE_AITER_UNIFIED_ATTN = "1"
+AITER_FLYDSL_FORCE = "1"
+SGLANG_MAMBA_SSM_DTYPE = "bfloat16"
+ROCM_QUICK_REDUCE_QUANTIZATION = "INT8"
+
+# Vars applied with os.environ.setdefault(key, value): a caller-supplied
+# value wins. AITER_JIT_DIR and SGLANG_HIP_EXT_DIR are also setdefault'd at
+# launch time, but their values are filesystem paths and live in the site
+# config instead (paths.aiter_jit_dir, paths.hip_ext_dir); see that file for
+# why those cache dirs must be fixed, pre-warmed, persistent paths rather
+# than fresh per-launch ones.
+[env_defaults]
+# AITER may JIT-build a kernel variant lazily on the first real request even
+# with a warm cache (e.g. an unmasked batch-prefill variant not exercised by
+# warmup, ~105s to build on 2026-09-05). SGLang's HTTP server kills itself
+# when the detokenizer stalls longer than SGLANG_HEALTH_CHECK_TIMEOUT
+# (default 20s), which turns a slow build into a dead server. Widen the
+# window so a build completes instead.
+SGLANG_HEALTH_CHECK_TIMEOUT = "1800"
+# On by default: job 632503 (ledger row H5g) accepted the skinny bf16 GEMM
+# on top of the fused MoE, TPOT 61.0 to 35.6 ms with p95 TTFT 458.8 ms (not
+# worse than fused alone), gates 13/13, benchmark version 2. A launch that
+# exports SGLANG_SKINNY_GEMM overrides this default (setdefault in
+# build_launch_env, _server.py).
+SGLANG_SKINNY_GEMM = "1"
+
+# On by default: job 632503 (ledger row H7f) accepted the HIP grouped-GEMM
+# fused MXFP4 MoE kernel alone, p95 TTFT turn 2+ 784.7 to 537.5 ms and TPOT
+# 106.8 to 61.0 ms, gates 13/13, benchmark version 2. A launch that exports
+# SGLANG_MXFP4_MOE_HIP overrides this default (setdefault in
+# build_launch_env, _server.py).
+SGLANG_MXFP4_MOE_HIP = "1"
+
+# On by default: skips the second tokenization of a text-only chat turn on
+# this multimodal-capable model (Qwen3.5's own config carries a
+# vision_config field unconditionally, so model_config.is_multimodal is
+# True here even though this deployment never sends image/audio/video
+# input). serving_chat.py normally decodes its own already-tokenized
+# prompt back to text and re-tokenizes it for the request it hands the
+# scheduler; when every message in a turn is text-only, this sends the
+# already-known input_ids instead and skips that round trip entirely.
+# Exactness: 0/253 mismatches against the decode-then-re-tokenize path
+# across every real turn in this task's own 48-session benchmark plus its
+# accuracy-gate holdout/history/arithmetic prompts (bit-exact,
+# kwargs_differ=False on this checkpoint). Paired acceptance (three
+# counterbalanced c48/c16 jobs on this platform, combined with
+# SGLANG_INCREMENTAL_TOKENIZE below): pooled p50 TTFT turn2+ -4.4% to
+# -4.5% at c48 (both boot orders) and -3.5% at c16, consistently across
+# every job; p95 TTFT moved -0.8% to -17.7% depending on boot order
+# (order-dependent, inside this cluster's own rep-to-rep spread, not
+# claimed as a clean win); TPOT never regressed. Gates 13/13 on every rep.
+# A launch that exports SGLANG_TEXT_ONLY_SEND_IDS overrides this default
+# (setdefault in build_launch_env, _server.py).
+SGLANG_TEXT_ONLY_SEND_IDS = "1"
+
+# On by default: tokenizes only the new suffix of a growing multi-turn
+# chat prompt instead of the whole conversation from scratch each turn,
+# reusing a cache of prior tokenizations keyed at special-token
+# boundaries. Exactness: 0/253 mismatches against full re-tokenization
+# across the same turn population as above (75.9% cache hit rate; misses
+# are each session's own turn 1 plus a small number of LRU evictions
+# across 48 concurrently-growing sessions sharing one 256-entry cache).
+# See SGLANG_TEXT_ONLY_SEND_IDS above for the combined-path acceptance
+# numbers measured with both switches on together. A launch that exports
+# SGLANG_INCREMENTAL_TOKENIZE overrides this default (setdefault in
+# build_launch_env, _server.py).
+SGLANG_INCREMENTAL_TOKENIZE = "1"
+
+# NEXTN (single-linear-draft-chain MTP) speculative decoding, on by default.
+# Acceptance jobs 633511 (defaults side) / 633512 (spec_k3 side), 48
+# sessions uncapped, 5 reps, one node: median mean TPOT 71 -> 38 ms
+# (-47%), p95 TTFT turn 2+ about 5% better, gates 13/13 every rep, mean
+# accept length 2.9 of 4 drafted tokens. K=3 was chosen over K=2 by the
+# probe that preceded acceptance (job 633510: defaults 65.6 ms, k=2 36.0 ms
+# (accept 2.52 of 3), k=3 33.6 ms (accept 2.92 of 4)), per the campaign's
+# K-selection rule: lower median TPOT wins unless its median p95 TTFT
+# turn2+ is more than 10% worse than defaults, which k=3's was not (-5.8%).
+# The 16-session-cap acceptance result was still pending when this default
+# was set.
+#
+# --enable-linear-replayssm-spec is the fast verify path for a linear
+# draft chain only (eagle_topk in {None, 1}, i.e. NEXTN); its backend
+# requirements (linear_attn_decode_backend in {triton, flashinfer}; aiter
+# attention's own AiterMultiStepDraftBackend) are already satisfied by this
+# platform's attention_backend/env above, so no extra flags are needed
+# alongside it.
+#
+# The draft model path is deliberately not a field here: it is site-owned
+# (see config/sites/<site>.toml's paths.model / paths.draft_model and
+# _server.py's speculative_decode_args(), which builds the full
+# --speculative-* argv from this table plus those paths) since this file
+# only holds values true of any node with this GPU and image, independent
+# of which site's filesystem it runs on.
+#
+# draft_load_format below (`"auto"`) is the fallback used only when a
+# site's paths.draft_model is unset: the draft then loads from paths.model,
+# the original (unsharded) checkpoint, since that is the only copy carrying
+# the mtp.* tensors the sharded fast-boot target artifact lacks. That
+# fallback path costs a real amount of boot time (draft weight load
+# ~455-498s, about 12.5 minutes of the ~866s total measured on the test cluster
+# without a draft_model artifact, versus under 5 minutes with speculative
+# decoding off). A site with paths.draft_model set (a draft-only
+# sharded_state artifact) bypasses draft_load_format here entirely --
+# speculative_decode_args() forces sharded_state for that path instead --
+# and the draft weight load drops to under 10s (job 633763, the test cluster: total
+# boot 365s). See config/sites/example.toml's paths.draft_model and
+# startup_timeout_s, and README.md's "Speculative decoding (NEXTN)"
+# section.
+#
+# Single documented switch to turn this off: export VIBESYS_SPEC_DECODE=0
+# before launching (checked in _server.py's speculative_decode_args()). To
+# keep a permanent side without it instead (e.g. a paired A/B where an env
+# var is less convenient than a fixed platform choice), copy this file with
+# the [speculative] table removed and select it with VIBESYS_PLATFORM, the
+# same pattern used above to disable mixed chunked prefill.
+[speculative]
+algorithm = "NEXTN"
+num_steps = 3
+eagle_topk = 1
+num_draft_tokens = 4
+enable_linear_replayssm_spec = true
+draft_load_format = "auto"
+
+# Overlap scheduler disabled by default: with it on, the CPU-side scheduler
+# runs one batch ahead of the GPU, so each session's first token of a turn
+# waits for an extra scheduler iteration before it is even forwarded.
+# Probe job 633552 (48 sessions, pooled per-rep) measured p95 TTFT turn 2+
+# 725-751 ms with the overlap scheduler on versus 494-531 ms off, mean TPOT
+# 35.7 ms versus 37.9 ms. The acceptance run for this default is still
+# pending; see README.md's "Overlap scheduler" section.
+#
+# Single documented switch to turn this back on: export
+# VIBESYS_OVERLAP_SCHEDULE=1 before launching (checked in _server.py's
+# overlap_schedule_enabled()). To keep a permanent side with it on instead,
+# copy this file with the [scheduler] table removed (or
+# disable_overlap_schedule set to false) and select it with
+# VIBESYS_PLATFORM, the same pattern used above for speculative decoding.
+[scheduler]
+disable_overlap_schedule = true
+
+# PyTorch TunableOp-tuned dense GEMM tile selection, on by default. hipBLASLt's
+# own heuristic picks one fixed GEMM tile per M for the six per-rank dense
+# projections (the qkvz/ba in-projections, the shared out-projection, the
+# attention qkv/o projections) and the LM head; TunableOp instead benchmarks a
+# set of candidate tiles per (N, M, K) ahead of time and records the fastest
+# one per M in results_file. Job 633793
+# (manual/dense-bench/bench_tunable_full.py) measured dense GEMM GPU time per
+# verify forward dropping from about 23ms to about 3.7ms at the modal batch,
+# output exact to one bf16 ULP against the untuned baseline; see
+# README.md's "Tuned dense GEMM tiles (TunableOp)" section for the full
+# per-shape numbers.
+#
+# results_file is relative to this platforms/ directory; config/loader.py
+# resolves it to an absolute path and, when enabled is true, raises if the
+# file is missing. This is the single committed table for all TP ranks, not
+# a per-rank path: PyTorch loads TunableOp results per device ordinal (see
+# README.md's "Tuned dense GEMM tiles (TunableOp)" section), so _server.py's
+# stage_tunableop_files() fans this one file out into a read-only copy per
+# ordinal at launch and points PYTORCH_TUNABLEOP_FILENAME at the %d-templated
+# staged path, rather than every rank reading results_file directly.
+#
+# The tuned table is specific to this image (sglang-v0.5.18-rocm700-mi30x)
+# and this GPU (gfx942 MI300A): PyTorch checks the file's own validator
+# header (PT_VERSION, ROCM_VERSION, HIPBLASLT_VERSION, GCN_ARCH_NAME,
+# ROCBLAS_VERSION) against the running process at load time, and on a
+# mismatch it silently ignores the whole file (a warning is logged, nothing
+# raises), which degrades serving to hipBLASLt's untuned heuristic with no
+# error. Regenerate the CSV with the same script whenever the image,
+# PyTorch, hipBLASLt, or the model's per-rank GEMM shapes change; export
+# PYTORCH_TUNABLEOP_VERBOSE=1 in the server env to confirm the file was
+# actually loaded (see README.md).
+#
+# Produced by manual/dense-bench/bench_tunable_full.py, job 633793: one
+# process per shape (the six dense projections plus the LM head), each
+# tuning all 36 M values the CUDA-graph capture set dispatches (the union of
+# target_verify, draft-decode, draft-extend, and gate-probe capture sets).
+#
+# Off switch: export VIBESYS_TUNABLEOP=0 before launching (checked in
+# _server.py's tunableop_enabled()) to fall back to hipBLASLt's own
+# heuristic for one run without editing this file.
+[tunableop]
+enabled = true
+results_file = "tunableop/mi300a-rocm700.csv"
+
+# Prefill CUDA graph, locked to "breakable", on by default. Prefill has no
+# CUDA graph unless cuda_graph_config[prefill].backend is set (decode
+# already captures one on this platform); breakable is a segmented-capture
+# backend with a real ROCm code path (no torch.compile), replayed over the
+# same 13 token-count buckets (256..1024, every multiple of 64) the
+# gemm-pad-m padding fix already warms at boot
+# (GEMM_PAD_WARMUP_TOKEN_COUNTS, _server.py). That list is not repeated
+# here: prefill_cuda_graph_args() (_server.py) reads it directly so the two
+# lists cannot drift apart.
+#
+# Paired end-to-end acceptance (manual/pcg-accept/acceptance.md on the test cluster,
+# jobs 634901 (c48, uncapped 48-session concurrency) and 634902 (c16,
+# 16-session cap), both on the gemm-pad-m bundle, draft PR #99,
+# SGLANG_AITER_GEMM_PAD_M=64, same source tree both sides): pooled p95 TTFT
+# turn 2+ 363.6 -> 321.1 ms at c48 (-11.7%) and 292.9 -> 206.4 ms at c16
+# (-29.5%); pooled p50 195.6 -> 150.1 ms at c48 (-23.3%). Mean/median TPOT
+# improved rather than merely held flat: -12.4% at c48, -9.1% at c16.
+# Gates 13/13 on every rep, both sides, both jobs (20/20 rep-gates plus 4/4
+# pre-bench gates). The c48 p95 improvement is smaller than the noisy
+# 5-rep range-based spread statistic alone would clear, but the paired
+# sign test (cand faster in 5/5 reps), the standard-deviation framing, and
+# the pooled n=830 percentile comparison all agree it is a real effect;
+# see acceptance.md's "primary-criterion evidence" section for the full
+# reasoning before changing this default.
+#
+# breakable, not tc_piecewise: this platform's NEXTN speculative decoding
+# ([speculative] above) resolves to the EAGLE algorithm family
+# (server_args.py's NEXTN->EAGLE alias; spec_info.py's
+# SpeculativeAlgorithm.is_eagle()), and the fork's cuda_graph_setup.py
+# routes the target model's prefill forward to the eager runner under
+# EAGLE-family speculative decode for every prefill CUDA-graph backend
+# except breakable (its PrefillCudaGraphRunner already captures FULL for
+# the EAGLE target on its own, so it is exempt from that skip). tc_piecewise
+# (torch.compile-based) would therefore run eager here regardless of this
+# flag, which is why it is not part of this acceptance.
+#
+# Exactness: token-level divergence between a captured-graph replay and an
+# eager forward sits at the stack's own bf16/reduction-order
+# nondeterminism floor, this track's accepted exactness tier; correctness
+# is judged by this task's own accuracy gate (checker.py) and the GSM8K
+# evaluation of record, not by byte-exact output-token replay.
+#
+# Off switch: export VIBESYS_PREFILL_GRAPH=0 before launching (checked in
+# _server.py's prefill_graph_enabled()) to drop the --cuda-graph-config
+# flag for one run without editing this file. For a permanent side without
+# it instead, copy this file with the [prefill_cuda_graph] table removed
+# and select it with VIBESYS_PLATFORM, the same pattern used above for
+# speculative decoding, the overlap scheduler, and TunableOp.
+[prefill_cuda_graph]
+backend = "breakable"
+
+[hf_loader]
+# MI300A is an APU with a single ~513 GB unified host+device pool, so bytes
+# parked in page cache (mmap'd shards, prefetched checkpoints) compete with
+# the model's own resident weights and the scheduler-init KV/Mamba-cache
+# allocation. Reading shards with normal I/O (no mmap) avoids that
+# contention. Only applies to the HF-checkpoint load path; the sharded_state
+# loader ignores this and reads its per-rank files without mmap regardless.
+disable_mmap = true
+# Measured 2026-09-05 (jobs 623402/623405/623406/623408/623409): with
+# --weight-loader-drop-cache-after-load, num_threads 4 and 8 crash at
+# scheduler init (uneven per-rank free memory, mamba cache sizing goes
+# negative). Without it, num_threads=4 loads in 122s but one of two
+# validation runs was OOM-killed mid-load, so it is not safe unattended.
+# num_threads=2 without drop-cache loads in 218s (vs 258s with it) and
+# leaves the same ~185 GB free after load as the drop-cache recipe. Kept as
+# the exact JSON string SGLang expects on --model-loader-extra-config.
+extra_config = '{"num_threads": 2}'

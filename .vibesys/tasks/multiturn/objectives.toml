@@ -1,0 +1,18 @@
+# Pareto frontier over a concurrency ramp's peak goodput and reference-level
+# tail latency. Each `name` must exactly match a metric `benchmark/run.py`
+# declares in its result protocol `hello` record (see `build_metric_specs`),
+# and an objective must be a required metric there, or the round is rejected.
+
+# Primary axis: also the headline scalar the loop reports and ranks a single
+# reading by. The best window throughput among ramp levels that do not breach
+# the latency guardrails (falling back to the best throughput of any valid
+# level if every level breached immediately). See `resolve_peak_goodput`.
+[[objective]]
+name = "peak_goodput_tok_s"
+direction = "max"
+
+# Latency axis: 95th percentile time-to-first-token over turn 2 and later, at
+# the reference concurrency level (C_REF = 16).
+[[objective]]
+name = "p95_ttft_turn2plus_ms_at_ref"
+direction = "min"
